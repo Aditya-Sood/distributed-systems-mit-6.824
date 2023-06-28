@@ -32,6 +32,7 @@ type RequestTaskFromCoordinatorReply struct {
 	TaskID                string `json:task_id`
 	IsMapTask             bool   `json: is_map_task`
 	TaskDetailsJsonString string `json:task_details_json_string`
+	AllTasksCompleted     bool   `json:tasks_left`
 }
 
 type UpdateCoordinatorOnTaskStatusArgs struct {
