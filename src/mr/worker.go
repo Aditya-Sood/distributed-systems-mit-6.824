@@ -80,9 +80,9 @@ func Worker(mapf func(string, string) []KeyValue,
 	for true {
 		time.Sleep(10 * time.Second)
 
-		// log.Printf("worker %v is awake, requesting coordinator for task...\n", workerHandle.ID)
+		log.Printf("worker %v is awake, requesting coordinator for task...\n", workerHandle.ID)
 
-		var coordinatorReply = RequestTaskFromCoordinator(&workerHandle)
+		var coordinatorReply = RequestTaskFromCoordinator(workerHandle)
 
 		if coordinatorReply.AllTasksCompleted {
 			break
@@ -93,12 +93,12 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		if coordinatorReply.IsMapTask {
-			// log.Printf("coordinator has assigned a mapper task\n")
+			log.Printf("coordinator has assigned a mapper task\n")
 
 			task := MapTaskDetails{}
 			json.Unmarshal([]byte(coordinatorReply.TaskDetailsJsonString), &task)
 
-			// log.Printf("running map function on input file %v ...\n", task.Filename)
+			log.Printf("running map function on input file %v ...\n", task.Filename)
 
 			intermediateKV := mapf(task.Filename, task.Contents)
 
@@ -280,13 +280,10 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func RequestTaskFromCoordinator(workerHandle *WorkerHandle) *RequestTaskFromCoordinatorReply {
+func RequestTaskFromCoordinator(workerHandle WorkerHandle) *RequestTaskFromCoordinatorReply {
 
 	// declare an argument structure.
-	args := RequestTaskFromCoordinatorArgs{}
-
-	// fill in the argument(s).
-	args.Worker = workerHandle
+	args := RequestTaskFromCoordinatorArgs{Worker: workerHandle}
 
 	// declare a reply structure.
 	reply := RequestTaskFromCoordinatorReply{}
@@ -306,18 +303,18 @@ func UpdateCoordinatorOnTaskStatus(workerHandle *WorkerHandle, isMapTask bool, t
 
 	// declare an argument structure.
 	// log.Println("updating coordinator on task completion")
-	args := UpdateCoordinatorOnTaskStatusArgs{}
+	args := UpdateCoordinatorOnTaskStatusArgs{
+		WorkerID:  workerHandle.ID,
+		IsMapTask: isMapTask,
+		TaskID:    taskID,
+		State:     status,
+	}
 
 	// fill in the argument(s).
-	args.WorkerID = workerHandle.ID
-	args.IsMapTask = isMapTask
-	args.TaskID = taskID
-	args.State = status
-
 	// log.Println("task status - ", args)
 
 	// declare a reply structure.
-	reply := RequestTaskFromCoordinatorReply{}
+	reply := UpdateCoordinatorOnTaskStatusReply{}
 
 	// send the RPC request, wait for the reply.
 	// the "Coordinator.Example" tells the
@@ -326,7 +323,7 @@ func UpdateCoordinatorOnTaskStatus(workerHandle *WorkerHandle, isMapTask bool, t
 	ok := call("Coordinator.UpdateCoordinatorOnTaskStatus", &args, &reply)
 
 	if ok {
-		fmt.Printf("updated coordinator about task status:\n%v\n", reply.TaskID)
+		fmt.Printf("updated coordinator about task status:\n%v\n", reply.Message)
 	} else {
 		fmt.Printf("call failed! : %v\n", ok)
 	}
