@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/rpc"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"time"
@@ -25,25 +24,15 @@ import (
 * -> So a 'for' loop with Time.sleep(10*Time.Second)
  */
 
+const (
+	MapperIntermediateFilenameTemplate = "mr-%v-%v"
+	ReducerFinalOutputFilenameTemplate = "mr-out-%v"
+)
+
 type WorkerHandle struct {
 	ID        string
 	IsWorking bool
 }
-
-type MapTaskDetails struct {
-	Filename          string `json: filename`
-	Contents          string `json: contents`
-	ReducePartitionCt int    `json: reduce_partition_count`
-}
-
-type ReduceTaskDetails struct {
-	ReducePartitionID int `json: reduce_partition_id`
-}
-
-const (
-	MapTaskDetailsJsonStringTemplate    = "{\"filename\":\"%v\", \"contents\": \"%v\", \"reduce_partition_count\": %v}"
-	ReduceTaskDetailsJsonStringTemplate = "{\"reduce_parition_id\": %v}"
-)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -76,11 +65,12 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 	var workerHandle = WorkerHandle{ID: uuid.New().String(), IsWorking: false}
+	log.Printf("Started worker process %v...\n", workerHandle)
 
-	for true {
+	for {
 		time.Sleep(10 * time.Second)
 
-		log.Printf("worker %v is awake, requesting coordinator for task...\n", workerHandle.ID)
+		// log.Printf("worker %v is awake, requesting coordinator for task...\n", workerHandle.ID)
 
 		var coordinatorReply = RequestTaskFromCoordinator(workerHandle)
 
@@ -92,13 +82,15 @@ func Worker(mapf func(string, string) []KeyValue,
 			continue
 		}
 
+		outputFilepaths := make(map[int]string)
+
 		if coordinatorReply.IsMapTask {
-			log.Printf("coordinator has assigned a mapper task\n")
+			// log.Printf("coordinator has assigned a mapper task\n")
 
 			task := MapTaskDetails{}
 			json.Unmarshal([]byte(coordinatorReply.TaskDetailsJsonString), &task)
 
-			log.Printf("running map function on input file %v ...\n", task.Filename)
+			// log.Printf("running map function on input file %v ...\n", task.Filename)
 
 			intermediateKV := mapf(task.Filename, task.Contents)
 
@@ -106,8 +98,8 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			//write results to appropriate intermediate keys file(s)
 			currentKey := intermediateKV[0].Key
-			currentHash := ihash(currentKey) % task.ReducePartitionCt
-			currFilename := fmt.Sprintf(MapperIntermediateFilenameTemplate, workerHandle.ID, strconv.Itoa(currentHash))
+			currentHash := ihash(currentKey) % task.ReducePartitionsCt
+			currFilename := fmt.Sprintf(MapperIntermediateFilenameTemplate, workerHandle.ID, currentHash)
 			outputFile, err := os.OpenFile(currFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
 			if err != nil {
 				log.Fatalf("cannot create %v", currFilename)
@@ -118,11 +110,17 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			for _, kv := range intermediateKV {
 				if kv.Key != currentKey {
-					outputFile.Close()
+
+					if err = outputFile.Close(); err != nil {
+						log.Fatalf("failed to close output file %v: %v", outputFile.Name(), err.Error())
+					} else {
+						outputFilepaths[currentHash] = outputFile.Name()
+					}
+
 					currentKey = kv.Key
-					currentHash = ihash(currentKey)%task.ReducePartitionCt + 1 //to keep partition count between 1 to task.ReducePartitionCt
+					currentHash = ihash(currentKey) % task.ReducePartitionsCt
 					currFilename = fmt.Sprintf(MapperIntermediateFilenameTemplate, workerHandle.ID, strconv.Itoa(currentHash))
-					outputFile, err := os.OpenFile(currFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+					outputFile, err = os.OpenFile(currFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
 					if err != nil {
 						log.Fatalf("cannot open %v", currFilename)
 					}
@@ -135,7 +133,11 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 			}
 			//since the last key won't trigger the if-else block above
-			outputFile.Close()
+			if err = outputFile.Close(); err != nil {
+				log.Fatalf("failed to close output file %v: %v", outputFile.Name(), err)
+			} else {
+				outputFilepaths[currentHash] = outputFile.Name()
+			}
 
 			// log.Printf("completed writing intermediate mapper results to file\n")
 
@@ -147,19 +149,19 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			partitionID := task.ReducePartitionID
 
-			filenamePattern := fmt.Sprintf(MapperIntermediateFilenameTemplatePattern, partitionID)
+			// filenamePattern := fmt.Sprintf(MapperIntermediateFilenameTemplatePattern, partitionID)
 			// log.Printf("searching for files matching intermediate output file(s) pattern %v ...\n", filenamePattern)
-			intermediateFilepaths, err := filepath.Glob("./" + filenamePattern)
+			intermediateFilepaths := task.InputFilesSet //, err := filepath.Glob("./" + filenamePattern)
 
-			if err != nil {
+			/* if err != nil {
 				log.Fatalf("unable to find intermediate files in the present working directory: %v", err)
-			}
+			} */
 
 			// log.Printf("reading from intermediate (key, value) result files...\n")
 			intermediateKVList := []KeyValue{}
 			var file *os.File
 			var openErr error
-			for _, filepath := range intermediateFilepaths {
+			for filepath := range intermediateFilepaths {
 				//find relevant filepaths
 				if file != nil {
 					file.Close()
@@ -220,13 +222,17 @@ func Worker(mapf func(string, string) []KeyValue,
 			reductionResult := reducef(curKey, curValues)
 			fmt.Fprintf(outputFile, "%v %v\n", curKey, reductionResult)
 
-			outputFile.Close()
+			if err := outputFile.Close(); err != nil {
+				log.Fatalf("failed to close output file %v: %v", outputFile.Name(), err)
+			} else {
+				outputFilepaths[0] = outputFile.Name()
+			}
 
 			// log.Printf("completed writing final reducer output to file %v\n", outputFile)
 		}
 
 		//inform coordinator of task status
-		UpdateCoordinatorOnTaskStatus(&workerHandle, coordinatorReply.IsMapTask, coordinatorReply.TaskID, Completed)
+		UpdateCoordinatorOnTaskCompletion(&workerHandle, coordinatorReply.IsMapTask, coordinatorReply.TaskID, Completed, outputFilepaths)
 	}
 
 	// log.Println("No pending tasks available with coordinator, shutting down worker process...")
@@ -280,16 +286,16 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
-func RequestTaskFromCoordinator(workerHandle WorkerHandle) *RequestTaskFromCoordinatorReply {
+func RequestTaskFromCoordinator(workerHandle WorkerHandle) *AssignTaskToWorkerProcessReply {
 
 	// declare an argument structure.
-	args := RequestTaskFromCoordinatorArgs{Worker: workerHandle}
+	args := AssignTaskToWorkerProcessRequest{Worker: workerHandle}
 
 	// declare a reply structure.
-	reply := RequestTaskFromCoordinatorReply{}
+	reply := AssignTaskToWorkerProcessReply{}
 
 	// send the RPC request, wait for the reply.
-	ok := call("Coordinator.RequestTaskFromCoordinator", &args, &reply)
+	ok := call("Coordinator.AssignTaskToWorkerProcess", &args, &reply)
 	if ok {
 		fmt.Printf("obtained task from coordinator:\n%v\n", reply.TaskID)
 	} else {
@@ -299,28 +305,29 @@ func RequestTaskFromCoordinator(workerHandle WorkerHandle) *RequestTaskFromCoord
 	return &reply
 }
 
-func UpdateCoordinatorOnTaskStatus(workerHandle *WorkerHandle, isMapTask bool, taskID string, status TaskState) {
+func UpdateCoordinatorOnTaskCompletion(workerHandle *WorkerHandle, isMapTask bool, taskID string, status TaskState, outputFilepaths map[int]string) {
 
 	// declare an argument structure.
 	// log.Println("updating coordinator on task completion")
-	args := UpdateCoordinatorOnTaskStatusArgs{
-		WorkerID:  workerHandle.ID,
-		IsMapTask: isMapTask,
-		TaskID:    taskID,
-		State:     status,
+	args := TaskCompletionUpdateRequest{
+		WorkerID:    workerHandle.ID,
+		IsMapTask:   isMapTask,
+		TaskID:      taskID,
+		State:       status,
+		OutputFiles: outputFilepaths,
 	}
 
 	// fill in the argument(s).
 	// log.Println("task status - ", args)
 
 	// declare a reply structure.
-	reply := UpdateCoordinatorOnTaskStatusReply{}
+	reply := TaskCompletionUpdateReply{}
 
 	// send the RPC request, wait for the reply.
 	// the "Coordinator.Example" tells the
 	// receiving server that we'd like to call
 	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.UpdateCoordinatorOnTaskStatus", &args, &reply)
+	ok := call("Coordinator.ReceiveTaskCompletionUpdate", &args, &reply)
 
 	if ok {
 		fmt.Printf("updated coordinator about task status:\n%v\n", reply.Message)

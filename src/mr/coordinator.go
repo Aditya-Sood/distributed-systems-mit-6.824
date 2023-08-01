@@ -16,12 +16,6 @@ import (
 
 // go run -race mrcoordinator.go pg-*.txt
 
-const (
-	MapperIntermediateFilenameTemplate        = "mr-%v-%v"
-	MapperIntermediateFilenameTemplatePattern = "mr-?*-%v"
-	ReducerFinalOutputFilenameTemplate        = "mr-out-%v"
-)
-
 type TaskState int
 
 const (
@@ -30,48 +24,50 @@ const (
 	Completed
 )
 
+// TODO: make struct private
 type TaskConfig struct {
-	ID        string
-	StartTime time.Time
-	//TODO: EndTime time.Time
+	ID             string
 	State          TaskState
 	AssignedWorker WorkerHandle
-	MapTask        *MapTask
-	ReduceTask     *ReduceTask
+	StartTime      time.Time
+	EndTime        time.Time
 }
 
-// Store task details (filename + contents for Mapper; reduce partition ID for Reducer)
-// and use a flag to decide whether to parse as a mapper or reducer task
+type MapTaskDetails struct {
+	Filename           string `json:"filename"`
+	Contents           string `json:"contents"`
+	ReducePartitionsCt int    `json:"reduce_partitions_count"`
+}
+
+type ReduceTaskDetails struct {
+	ReducePartitionID int             `json:"reduce_partition_id"`
+	InputFilesSet     map[string]bool `json:"input_intermediate_files"` //set of input intermediate value files, since they may repeat between map tasks
+}
+
+const (
+	MapTaskDetailsJsonStringTemplate    = "{\"filename\":\"%v\", \"contents\": \"%v\", \"reduce_partition_count\": %v}"
+	ReduceTaskDetailsJsonStringTemplate = "{\"reduce_parition_id\": %v}"
+)
 
 type MapTask struct {
-	Filename string
-	Contents string
+	TaskConfig
+	MapTaskDetails
+	OutputIntermediateFiles map[int]string //map so that each parition's intermediate file can be found using key
 }
 
 type ReduceTask struct {
-	ReducePartitionID int
-}
-
-type TaskWithState interface {
-	getTaskState() TaskState
-}
-
-func (c *TaskConfig) getTaskState() TaskState {
-	return c.State
+	TaskConfig
+	ReduceTaskDetails
 }
 
 type Coordinator struct {
 	// Your definitions here.
-	//Location of results, state of tasks
-	InputFiles        []string
-	ReducePartitionCt int
-	MapperCfgs        []TaskConfig
-	MtxMapper         sync.Mutex
-	ReducerCfgs       []TaskConfig
-	MtxReducer        sync.Mutex
+	InputFiles []string
+	MTasks     []MapTask
+	MMtx       sync.RWMutex
+	RTasks     []ReduceTask
+	RMtx       sync.RWMutex
 }
-
-//TODO: Start Reducer and keep it reading until all mappers complete, and then start
 
 // Your code here -- RPC handlers for the worker to call.
 
@@ -103,23 +99,30 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	isTaskPending := checkForPendingTasks(c.MapperCfgs, &c.MtxMapper) || checkForPendingTasks(c.ReducerCfgs, &c.MtxReducer)
-	ret = !isTaskPending
-	// log.Println("Done is ", ret)
+	ret = c.areAllTasksComplete()
+	// log.Println("Done is", ret)
 
 	return ret
 }
 
-func checkForPendingTasks(tasks []TaskConfig, taskMutex *sync.Mutex) bool {
-	isTaskPending := false
-
-	taskMutex.Lock()
-	for i := 0; !isTaskPending && i < len(tasks); i++ {
-		isTaskPending = (tasks[i].getTaskState() != Completed)
+func (c *Coordinator) areAllTasksComplete() bool {
+	c.MMtx.RLock()
+	defer c.MMtx.RUnlock()
+	for _, mTask := range c.MTasks {
+		if mTask.State != Completed {
+			return false
+		}
 	}
-	taskMutex.Unlock()
 
-	return isTaskPending
+	c.RMtx.RLock()
+	defer c.RMtx.RUnlock()
+	for _, rTask := range c.RTasks {
+		if rTask.State != Completed {
+			return false
+		}
+	}
+
+	return true
 }
 
 // create a Coordinator.
@@ -127,37 +130,55 @@ func checkForPendingTasks(tasks []TaskConfig, taskMutex *sync.Mutex) bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		InputFiles:        append([]string{}, files...),
-		ReducePartitionCt: nReduce,
-		MapperCfgs:        make([]TaskConfig, len(files)),
-		ReducerCfgs:       make([]TaskConfig, nReduce),
+		InputFiles: append([]string{}, files...),
+		MTasks:     make([]MapTask, len(files)),
+		RTasks:     make([]ReduceTask, nReduce),
 	}
 
 	// Your code here.
 	//Create mapper tasks
 	for ind, filename := range c.InputFiles {
-		c.MapperCfgs[ind].ID = strconv.Itoa(ind)
-		c.MapperCfgs[ind].State = Pending
-		c.MapperCfgs[ind].MapTask = &MapTask{Filename: filename, Contents: string(GetFileContent(filename))}
+		c.MTasks[ind] = MapTask{
+			TaskConfig: TaskConfig{
+				ID:    strconv.Itoa(ind),
+				State: Pending,
+			},
+			MapTaskDetails: MapTaskDetails{
+				Filename:           filename,
+				Contents:           string(GetFileContent(filename)),
+				ReducePartitionsCt: nReduce,
+			},
+			OutputIntermediateFiles: make(map[int]string),
+		}
 
-		log.Println("created task ", c.MapperCfgs[ind])
+		log.Println("created map task", c.MTasks[ind].ID)
 	}
 
-	//Create proposed reducer tasks
+	//Create reducer tasks
 	for i := 0; i < nReduce; i++ {
-		c.ReducerCfgs[i].ID = strconv.Itoa(i + 1)
-		c.ReducerCfgs[i].State = Pending
-		c.ReducerCfgs[i].ReduceTask = &ReduceTask{ReducePartitionID: i + 1}
+		c.RTasks[i] = ReduceTask{
+			TaskConfig: TaskConfig{
+				ID:    strconv.Itoa(i),
+				State: Pending,
+			},
+			ReduceTaskDetails: ReduceTaskDetails{
+				ReducePartitionID: i,
+				InputFilesSet:     make(map[string]bool),
+			},
+		}
+
+		log.Println("created reduce task", c.RTasks[i].ID)
 	}
 
-	// log.Println("created Coordinator object, returning control to mrcoordinator.go ...")
+	log.Println("created Coordinator object, returning control to mrcoordinator.go ...")
 
 	c.server()
 	return &c
 }
 
-func (c *Coordinator) RequestTaskFromCoordinator(args *RequestTaskFromCoordinatorArgs, reply *RequestTaskFromCoordinatorReply) error {
+func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessRequest, reply *AssignTaskToWorkerProcessReply) error {
 	// TODO: Check for errors and return appropriately below
+	//c.RTasks[ind].InputIntermediateFiles
 
 	//Check for available mapper tasks
 	reply.AllTasksCompleted = false
@@ -166,12 +187,12 @@ func (c *Coordinator) RequestTaskFromCoordinator(args *RequestTaskFromCoordinato
 
 	avlTaskInd := -1
 
-	c.MtxMapper.Lock()
-	defer c.MtxMapper.Unlock()
-	for ind := range c.MapperCfgs {
-		mapTasksInProgress = (mapTasksInProgress || (c.MapperCfgs[ind].State == InProgress))
+	c.MMtx.Lock()
+	defer c.MMtx.Unlock()
+	for ind := range c.MTasks {
+		mapTasksInProgress = (mapTasksInProgress || (c.MTasks[ind].State == InProgress))
 
-		if c.MapperCfgs[ind].State == Pending {
+		if c.MTasks[ind].State == Pending {
 			avlTaskInd = ind
 			break
 		}
@@ -180,25 +201,23 @@ func (c *Coordinator) RequestTaskFromCoordinator(args *RequestTaskFromCoordinato
 	if avlTaskInd == -1 && mapTasksInProgress {
 		//No map tasks are pending but one or more are in-progress
 		//So can't start reducer phase
+		//Hence not assigning new tasks
 
 		reply.TaskID = ""
 		reply.TaskDetailsJsonString = ""
+		reply.AllTasksCompleted = false
 
 		return nil
 
 	} else if avlTaskInd != -1 {
 		log.Printf("found pending mapper task %v\n", avlTaskInd)
 
-		c.MapperCfgs[avlTaskInd].AssignedWorker = args.Worker
-		c.MapperCfgs[avlTaskInd].StartTime = time.Now()
-		c.MapperCfgs[avlTaskInd].State = InProgress
+		c.MTasks[avlTaskInd].AssignedWorker = args.Worker
+		c.MTasks[avlTaskInd].StartTime = time.Now()
+		c.MTasks[avlTaskInd].State = InProgress
 
-		reply.TaskID = c.MapperCfgs[avlTaskInd].ID
-		taskStruct := MapTaskDetails{
-			Filename:          c.MapperCfgs[avlTaskInd].MapTask.Filename,
-			Contents:          c.MapperCfgs[avlTaskInd].MapTask.Contents,
-			ReducePartitionCt: c.ReducePartitionCt,
-		}
+		reply.TaskID = c.MTasks[avlTaskInd].ID
+		taskStruct := c.MTasks[avlTaskInd].MapTaskDetails
 
 		marshalOp, marshalErr := json.Marshal(taskStruct)
 
@@ -209,9 +228,9 @@ func (c *Coordinator) RequestTaskFromCoordinator(args *RequestTaskFromCoordinato
 			reply.TaskDetailsJsonString = string(marshalOp)
 		}
 
-		log.Printf("assigning mapper task %v to worker (ID) %v\n", c.MapperCfgs[avlTaskInd].MapTask.Filename, c.MapperCfgs[avlTaskInd].AssignedWorker.ID)
+		log.Printf("assigning mapper task %v to worker (ID) %v\n", c.MTasks[avlTaskInd].Filename, c.MTasks[avlTaskInd].AssignedWorker.ID)
 
-		go checkTaskResult(&c.MapperCfgs[avlTaskInd], &c.MtxMapper)
+		go c.checkTaskResult(&c.MTasks[avlTaskInd])
 
 		return nil
 	}
@@ -223,32 +242,49 @@ func (c *Coordinator) RequestTaskFromCoordinator(args *RequestTaskFromCoordinato
 
 	avlTaskInd = -1
 
-	c.MtxReducer.Lock()
-	for ind := range c.ReducerCfgs {
-		reduceTasksInProgress = (reduceTasksInProgress || (c.ReducerCfgs[ind].State == InProgress))
+	c.RMtx.Lock()
+	defer c.RMtx.Unlock() //Doesn't cause deadlock with ReceiveTaskCompletionUpdate
+	for ind := range c.RTasks {
+		reduceTasksInProgress = (reduceTasksInProgress || (c.RTasks[ind].State == InProgress))
 
-		if c.ReducerCfgs[ind].State == Pending {
+		if c.RTasks[ind].State == Pending {
 			avlTaskInd = ind
 			break
 		}
 	}
-	// // log.Println("Unlocking at 257")
-	c.MtxReducer.Unlock()
 
-	if avlTaskInd != -1 {
-		// log.Printf("found pending reducer task %v\n", availableReduceTask)
+	//No pending (mapper or reducer) tasks exist
+	if avlTaskInd == -1 && reduceTasksInProgress {
+		//No reduce tasks are pending but one or more are in-progress
+		//So can't end worker
+		reply.TaskID = ""
+		reply.TaskDetailsJsonString = ""
+		reply.AllTasksCompleted = false
 
-		// // log.Println("Locking at 263")
-		c.MtxReducer.Lock()
-		c.ReducerCfgs[avlTaskInd].AssignedWorker = args.Worker
-		c.ReducerCfgs[avlTaskInd].StartTime = time.Now()
-		c.ReducerCfgs[avlTaskInd].State = InProgress
-		// // log.Println("Unlocking at 268")
-		c.MtxReducer.Unlock()
+		return nil
 
-		reply.TaskID = c.ReducerCfgs[avlTaskInd].ID
-		taskStruct := ReduceTask{
-			ReducePartitionID: c.ReducerCfgs[avlTaskInd].ReduceTask.ReducePartitionID,
+	} else if avlTaskInd != -1 {
+		log.Printf("found pending reducer task %v\n", c.RTasks[avlTaskInd].ID)
+
+		//Set coordinator values
+		c.RTasks[avlTaskInd].AssignedWorker = args.Worker
+		c.RTasks[avlTaskInd].StartTime = time.Now()
+		c.RTasks[avlTaskInd].State = InProgress
+
+		//Prepare reply for worker
+		reply.TaskID = c.RTasks[avlTaskInd].ID
+
+		reducerTaskPartitionID := c.RTasks[avlTaskInd].ReducePartitionID
+		intermediateFiles := make(map[string]bool)
+
+		for _, mTask := range c.MTasks {
+			filepath := mTask.OutputIntermediateFiles[reducerTaskPartitionID]
+			intermediateFiles[filepath] = true
+		}
+
+		taskStruct := ReduceTaskDetails{
+			ReducePartitionID: reducerTaskPartitionID,
+			InputFilesSet:     intermediateFiles,
 		}
 
 		marshalOp, marshalErr := json.Marshal(taskStruct)
@@ -259,47 +295,47 @@ func (c *Coordinator) RequestTaskFromCoordinator(args *RequestTaskFromCoordinato
 			reply.TaskDetailsJsonString = string(marshalOp)
 		}
 
-		log.Printf("assigning reducer task %v\n", c.ReducerCfgs[avlTaskInd])
+		log.Printf("assigning reducer task %v\n", c.RTasks[avlTaskInd].ID)
 
-		go checkTaskResult(&c.ReducerCfgs[avlTaskInd], &c.MtxReducer)
+		go c.checkTaskResult(&c.RTasks[avlTaskInd])
 
 		return nil
 	}
 
-	//No pending (mapper or reducer) tasks exist
-	if reduceTasksInProgress {
-		//No reduce tasks are pending but one or more are in-progress
-		//So can't end worker
-		reply.TaskID = ""
-		reply.TaskDetailsJsonString = ""
-
-	} else {
-		reply.AllTasksCompleted = true //no pending or in-progress tasks left, can end worker processes
-	}
-
+	reply.AllTasksCompleted = true //no pending or in-progress tasks left, can end worker processes
 	return nil
 }
 
-func checkTaskResult(taskConfig *TaskConfig, taskMutex *sync.Mutex) {
-	time.Sleep(40 * time.Second) //Since task completion timeout period is 10 seconds
+func (c *Coordinator) checkTaskResult(task interface{}) {
+	time.Sleep(120 * time.Second) //Task completion timeout period is 10s but raising to 100s due to timeouts (as list of intermediate files need to be passed)
 
-	log.Printf("checking status of task %v\n", taskConfig.ID)
+	var taskCfg *TaskConfig
+	var taskMtx *sync.RWMutex
 
-	taskMutex.Lock()
-	if taskConfig.State != Completed {
-		log.Printf("task %v not completed, resetting...\n", taskConfig.ID)
+	if mTask, ok := task.(*MapTask); ok {
+		taskCfg = &(mTask.TaskConfig)
+		taskMtx = &c.MMtx
 
-		taskConfig.StartTime = time.Time{}
-		taskConfig.State = Pending
-		taskConfig.AssignedWorker = WorkerHandle{}
+	} else if rTask, ok := task.(*ReduceTask); ok {
+		taskCfg = &(rTask.TaskConfig)
+		taskMtx = &c.RMtx
+
+	} else {
+		log.Fatalf("ERROR: received value is of unexpected type %T\n", task)
+		return
 	}
-	taskMutex.Unlock()
-	/*
-	*
-	*
-	*
-	*
-	 */
+
+	log.Printf("checking status of task %v\n", taskCfg.ID)
+
+	taskMtx.Lock()
+	defer taskMtx.Unlock()
+	if taskCfg.State != Completed {
+		log.Printf("task %v not completed, resetting...\n", taskCfg.ID)
+
+		taskCfg.StartTime = time.Time{}
+		taskCfg.State = Pending
+		taskCfg.AssignedWorker = WorkerHandle{}
+	}
 }
 
 func GetFileContent(filename string) []byte {
@@ -317,71 +353,82 @@ func GetFileContent(filename string) []byte {
 	return content
 }
 
-func (c *Coordinator) UpdateCoordinatorOnTaskStatus(args *UpdateCoordinatorOnTaskStatusArgs, reply *UpdateCoordinatorOnTaskStatusReply) error {
+func (c *Coordinator) ReceiveTaskCompletionUpdate(args *TaskCompletionUpdateRequest, reply *TaskCompletionUpdateReply) error {
 	//copy arguments from args
 	workerID := args.WorkerID
 	isMapTask := args.IsMapTask
 	taskId := args.TaskID
 	status := args.State
+	outputFiles := args.OutputFiles
 
 	log.Printf("received status update from worker %v for task ID %v\n", workerID, taskId)
 
 	if isMapTask {
-		// // log.Println("Locking at 351")
-		c.MtxMapper.Lock()
-		// // log.Println("Unlocking at 353")
-		defer c.MtxMapper.Unlock()
+		c.MMtx.Lock()
+		defer c.MMtx.Unlock()
 
-		tasksList := c.MapperCfgs
+		tasksList := c.MTasks
 
 		for ind, mapTask := range tasksList {
-			log.Printf("checking on task %v - %v\n", mapTask.MapTask.Filename, mapTask)
+			// log.Printf("comparing received task ID %v with task %v - %v\n", taskId, mapTask.ID, mapTask.Filename)
 
 			if mapTask.ID != taskId {
-				log.Printf("warn: %v doesn't match required task ID %v\n", mapTask.ID, taskId)
 				continue
 			}
 
-			log.Println("found matching task")
+			// log.Println("found matching task")
 
-			if mapTask.AssignedWorker.ID != workerID {
+			if mapTask.State != InProgress {
+				log.Printf("ERROR: task is in state %v, not valid to recieve a completion update", mapTask.State)
+				return errors.New("task not in-progress, invalid completion update")
+
+			} else if mapTask.AssignedWorker.ID != workerID {
 				log.Printf("stale update received: worker %v is no longer the assigned worker, status update to be received from %v\n", workerID, mapTask.AssignedWorker.ID)
 				return errors.New("worker task considered to have timed-out, status not updated")
 			}
 
 			log.Printf("status update for map task %v - %v\n", taskId, status)
 
-			c.MapperCfgs[ind].State = status
+			c.MTasks[ind].State = status
+
+			if status == Completed {
+				c.MTasks[ind].OutputIntermediateFiles = outputFiles
+			}
 
 			break
 		}
 
 	} else {
-		// // log.Println("Locking at 381")
-		c.MtxReducer.Lock()
-		// // log.Println("Unlocking at 383")
-		defer c.MtxReducer.Unlock()
+		c.RMtx.Lock()
+		defer c.RMtx.Unlock()
 
-		tasksList := c.ReducerCfgs
+		tasksList := c.RTasks
 
 		for ind, reduceTask := range tasksList {
-			log.Printf("checking on task %v - %v\n", reduceTask.ReduceTask.ReducePartitionID, reduceTask)
+			// log.Printf("comparing received task ID %v with task %v - %v\n", taskId, reduceTask.ID, reduceTask.ReducePartitionID)
 
 			if reduceTask.ID != taskId {
-				log.Printf("warn: %v doesn't match required task ID %v", reduceTask.ID, taskId)
 				continue
 			}
 
-			log.Println("found matching task")
+			// log.Println("found matching task")
 
-			if reduceTask.AssignedWorker.ID != workerID {
+			if reduceTask.State != InProgress {
+				log.Printf("ERROR: task is in state %v, not valid to recieve a completion update", reduceTask.State)
+				return errors.New("task not in-progress, invalid completion update")
+
+			} else if reduceTask.AssignedWorker.ID != workerID {
 				log.Printf("stale update received: worker %v is no longer the assigned worker, status update to be received from %v\n", workerID, reduceTask.AssignedWorker.ID)
 				return errors.New("worker task considered to have timed-out, status not updated")
 			}
 
 			log.Printf("status update for reduce task %v - %v\n", taskId, status)
 
-			c.ReducerCfgs[ind].State = status
+			c.RTasks[ind].State = status
+
+			if status == Completed {
+				log.Println("reduce output stored in", outputFiles[0])
+			}
 
 			break
 		}
