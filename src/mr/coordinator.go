@@ -26,11 +26,11 @@ const (
 
 // TODO: make struct private
 type TaskConfig struct {
-	ID             string
-	State          TaskState
-	AssignedWorker WorkerHandle
-	StartTime      time.Time
-	EndTime        time.Time
+	ID               string
+	State            TaskState
+	AssignedWorkerID string
+	StartTime        time.Time
+	EndTime          time.Time
 }
 
 type MapTaskDetails struct {
@@ -40,8 +40,8 @@ type MapTaskDetails struct {
 }
 
 type ReduceTaskDetails struct {
-	ReducePartitionID int             `json:"reduce_partition_id"`
-	InputFilesSet     map[string]bool `json:"input_intermediate_files"` //set of input intermediate value files, since they may repeat between map tasks
+	ReducePartitionID int      `json:"reduce_partition_id"`
+	InputFilesSet     []string `json:"input_intermediate_files"` //list of input intermediate (k,v) files
 }
 
 const (
@@ -163,7 +163,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			},
 			ReduceTaskDetails: ReduceTaskDetails{
 				ReducePartitionID: i,
-				InputFilesSet:     make(map[string]bool),
+				InputFilesSet:     []string{},
 			},
 		}
 
@@ -212,7 +212,7 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 	} else if avlTaskInd != -1 {
 		log.Printf("found pending mapper task %v\n", avlTaskInd)
 
-		c.MTasks[avlTaskInd].AssignedWorker = args.Worker
+		c.MTasks[avlTaskInd].AssignedWorkerID = args.WorkerID
 		c.MTasks[avlTaskInd].StartTime = time.Now()
 		c.MTasks[avlTaskInd].State = InProgress
 
@@ -228,7 +228,7 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 			reply.TaskDetailsJsonString = string(marshalOp)
 		}
 
-		log.Printf("assigning mapper task %v to worker (ID) %v\n", c.MTasks[avlTaskInd].Filename, c.MTasks[avlTaskInd].AssignedWorker.ID)
+		log.Printf("assigning mapper task %v to worker (ID) %v\n", c.MTasks[avlTaskInd].Filename, c.MTasks[avlTaskInd].AssignedWorkerID)
 
 		go c.checkTaskResult(&c.MTasks[avlTaskInd])
 
@@ -267,7 +267,7 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 		log.Printf("found pending reducer task %v\n", c.RTasks[avlTaskInd].ID)
 
 		//Set coordinator values
-		c.RTasks[avlTaskInd].AssignedWorker = args.Worker
+		c.RTasks[avlTaskInd].AssignedWorkerID = args.WorkerID
 		c.RTasks[avlTaskInd].StartTime = time.Now()
 		c.RTasks[avlTaskInd].State = InProgress
 
@@ -275,11 +275,11 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 		reply.TaskID = c.RTasks[avlTaskInd].ID
 
 		reducerTaskPartitionID := c.RTasks[avlTaskInd].ReducePartitionID
-		intermediateFiles := make(map[string]bool)
+		intermediateFiles := make([]string, 0)
 
 		for _, mTask := range c.MTasks {
 			filepath := mTask.OutputIntermediateFiles[reducerTaskPartitionID]
-			intermediateFiles[filepath] = true
+			intermediateFiles = append(intermediateFiles, filepath)
 		}
 
 		taskStruct := ReduceTaskDetails{
@@ -307,7 +307,8 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 }
 
 func (c *Coordinator) checkTaskResult(task interface{}) {
-	time.Sleep(120 * time.Second) //Task completion timeout period is 10s but raising to 100s due to timeouts (as list of intermediate files need to be passed)
+	//increased task completion timeout period from 10s since tasks are always alive when resetting tasks, plus a framework-accurate heartbeat model would behave the same
+	time.Sleep(60 * time.Second)
 
 	var taskCfg *TaskConfig
 	var taskMtx *sync.RWMutex
@@ -334,7 +335,7 @@ func (c *Coordinator) checkTaskResult(task interface{}) {
 
 		taskCfg.StartTime = time.Time{}
 		taskCfg.State = Pending
-		taskCfg.AssignedWorker = WorkerHandle{}
+		taskCfg.AssignedWorkerID = ""
 	}
 }
 
@@ -382,8 +383,8 @@ func (c *Coordinator) ReceiveTaskCompletionUpdate(args *TaskCompletionUpdateRequ
 				log.Printf("ERROR: task is in state %v, not valid to recieve a completion update", mapTask.State)
 				return errors.New("task not in-progress, invalid completion update")
 
-			} else if mapTask.AssignedWorker.ID != workerID {
-				log.Printf("stale update received: worker %v is no longer the assigned worker, status update to be received from %v\n", workerID, mapTask.AssignedWorker.ID)
+			} else if mapTask.AssignedWorkerID != workerID {
+				log.Printf("stale update received: worker %v is no longer the assigned worker, status update to be received from %v\n", workerID, mapTask.AssignedWorkerID)
 				return errors.New("worker task considered to have timed-out, status not updated")
 			}
 
@@ -417,8 +418,8 @@ func (c *Coordinator) ReceiveTaskCompletionUpdate(args *TaskCompletionUpdateRequ
 				log.Printf("ERROR: task is in state %v, not valid to recieve a completion update", reduceTask.State)
 				return errors.New("task not in-progress, invalid completion update")
 
-			} else if reduceTask.AssignedWorker.ID != workerID {
-				log.Printf("stale update received: worker %v is no longer the assigned worker, status update to be received from %v\n", workerID, reduceTask.AssignedWorker.ID)
+			} else if reduceTask.AssignedWorkerID != workerID {
+				log.Printf("stale update received: worker %v is no longer the assigned worker, status update to be received from %v\n", workerID, reduceTask.AssignedWorkerID)
 				return errors.New("worker task considered to have timed-out, status not updated")
 			}
 

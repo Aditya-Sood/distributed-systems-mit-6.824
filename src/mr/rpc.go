@@ -25,7 +25,7 @@ type ExampleReply struct {
 }
 
 type AssignTaskToWorkerProcessRequest struct {
-	Worker WorkerHandle
+	WorkerID string
 }
 
 type AssignTaskToWorkerProcessReply struct {
