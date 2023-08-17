@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -23,7 +25,28 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type AssignTaskToWorkerProcessRequest struct {
+	WorkerID string
+}
 
+type AssignTaskToWorkerProcessReply struct {
+	TaskID                string `json:"task_id"`
+	IsMapTask             bool   `json:"is_map_task"`
+	TaskDetailsJsonString string `json:"task_details_json_string"`
+	AllTasksCompleted     bool   `json:"tasks_left"`
+}
+
+type TaskCompletionUpdateRequest struct {
+	WorkerID    string //since multiple workers could pick up the same task, need an identifier to confirm that only changes from the current task owner are picked
+	IsMapTask   bool
+	TaskID      string
+	State       TaskState
+	OutputFiles map[int]string
+}
+
+type TaskCompletionUpdateReply struct {
+	Message string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
