@@ -2,7 +2,3 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
-src/main/mr-*
-commands_in_use.sh
-src/main/cr-output.txt
-src/main/output.txt

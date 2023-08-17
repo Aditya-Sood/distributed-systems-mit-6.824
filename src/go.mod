@@ -1,4 +1,4 @@
-module 6.824
+module 6.5840
 
 go 1.15
 

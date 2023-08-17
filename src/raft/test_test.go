@@ -146,10 +146,8 @@ func TestBasicAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // check, based on counting bytes of RPCs, that
 // each command is sent to each peer just once.
-//
 func TestRPCBytes2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -181,10 +179,8 @@ func TestRPCBytes2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // test just failure of followers.
-//
-func For2023TestFollowerFailure2B(t *testing.T) {
+func TestFollowerFailure2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -228,10 +224,8 @@ func For2023TestFollowerFailure2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // test just failure of leaders.
-//
-func For2023TestLeaderFailure2B(t *testing.T) {
+func TestLeaderFailure2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -270,10 +264,8 @@ func For2023TestLeaderFailure2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // test that a follower participates after
 // disconnect and re-connect.
-//
 func TestFailAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -802,7 +794,6 @@ func TestPersist32C(t *testing.T) {
 	cfg.end()
 }
 
-//
 // Test the scenarios described in Figure 8 of the extended Raft paper. Each
 // iteration asks a leader, if there is one, to insert a command in the Raft
 // log.  If there is a leader, that leader will fail quickly with a high
@@ -811,7 +802,6 @@ func TestPersist32C(t *testing.T) {
 // alive servers isn't enough to form a majority, perhaps start a new server.
 // The leader in a new term may try to finish replicating log entries that
 // haven't been committed yet.
-//
 func TestFigure82C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -1192,11 +1182,9 @@ func TestSnapshotInstallUnCrash2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (unreliable+crash)", false, false, true)
 }
 
-//
 // do the servers persist the snapshots, and
 // restart using snapshot along with the
 // tail of the log?
-//
 func TestSnapshotAllCrash2D(t *testing.T) {
 	servers := 3
 	iters := 5
@@ -1232,5 +1220,51 @@ func TestSnapshotAllCrash2D(t *testing.T) {
 			t.Fatalf("index decreased from %v to %v", index1, index2)
 		}
 	}
+	cfg.end()
+}
+
+// do servers correctly initialize their in-memory copy of the snapshot, making
+// sure that future writes to persistent state don't lose state?
+func TestSnapshotInit2D(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false, true)
+	defer cfg.cleanup()
+
+	cfg.begin("Test (2D): snapshot initialization after crash")
+	cfg.one(rand.Int(), servers, true)
+
+	// enough ops to make a snapshot
+	nn := SnapShotInterval + 1
+	for i := 0; i < nn; i++ {
+		cfg.one(rand.Int(), servers, true)
+	}
+
+	// crash all
+	for i := 0; i < servers; i++ {
+		cfg.crash1(i)
+	}
+
+	// revive all
+	for i := 0; i < servers; i++ {
+		cfg.start1(i, cfg.applierSnap)
+		cfg.connect(i)
+	}
+
+	// a single op, to get something to be written back to persistent storage.
+	cfg.one(rand.Int(), servers, true)
+
+	// crash all
+	for i := 0; i < servers; i++ {
+		cfg.crash1(i)
+	}
+
+	// revive all
+	for i := 0; i < servers; i++ {
+		cfg.start1(i, cfg.applierSnap)
+		cfg.connect(i)
+	}
+
+	// do another op to trigger potential bug
+	cfg.one(rand.Int(), servers, true)
 	cfg.end()
 }
