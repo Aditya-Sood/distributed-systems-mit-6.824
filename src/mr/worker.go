@@ -14,16 +14,6 @@ import (
 	"github.com/google/uuid"
 )
 
-//TODO: Deadlock exists for multi-worker tests - 4 to 5 workers triggerring deadlock
-
-// go build -race -buildmode=plugin ../mrapps/wc.go && go run -race mrworker.go wc.so
-
-/*
-* Keep checking for tasks every timeout seconds (10 sec)
-* Workers will stay up until manually killed (since the tasks go to Coordinator directly, and worker won't be involved)
-* -> So a 'for' loop with Time.sleep(10*Time.Second)
- */
-
 const (
 	MapperIntermediateFilenameTemplate = "mr-%v-%v-%v"
 	ReducerFinalOutputFilenameTemplate = "mr-out-%v"
@@ -61,12 +51,13 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	//mapf works on (filename, contents) to return a slice of (k, v)
-	//reducef works on (key, slice of key values) to return the reduced output for the key
+	//reducef works on (key, slice of values) to return the reduced output for the key
 
 	// Your worker implementation here.
 	var workerHandle = WorkerHandle{ID: uuid.New().String(), IsWorking: false}
 	// log.Printf("Started worker process %v...\n", workerHandle)
 
+reset:
 	for {
 		time.Sleep(10 * time.Second)
 
@@ -97,9 +88,10 @@ func Worker(mapf func(string, string) []KeyValue,
 			currentKey := intermediateKV[0].Key
 			currentHash := ihash(currentKey) % task.ReducePartitionsCt
 			currFilename := fmt.Sprintf(MapperIntermediateFilenameTemplate, workerHandle.ID, taskID, currentHash)
-			outputFile, err := os.OpenFile(currFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+			outputFile, err := os.Create(currFilename)
 			if err != nil {
-				log.Fatalf("cannot create %v", currFilename)
+				log.Printf("ERROR: cannot create %v", currFilename)
+				continue reset
 			}
 			encoder := json.NewEncoder(outputFile)
 
@@ -109,7 +101,8 @@ func Worker(mapf func(string, string) []KeyValue,
 				if kv.Key != currentKey {
 
 					if err = outputFile.Close(); err != nil {
-						log.Fatalf("failed to close output file %v: %v", outputFile.Name(), err)
+						log.Printf("ERROR: failed to close output file %v: %v", outputFile.Name(), err)
+						continue reset
 					} else {
 						outputFilepaths[currentHash] = outputFile.Name()
 					}
@@ -117,21 +110,24 @@ func Worker(mapf func(string, string) []KeyValue,
 					currentKey = kv.Key
 					currentHash = ihash(currentKey) % task.ReducePartitionsCt
 					currFilename = fmt.Sprintf(MapperIntermediateFilenameTemplate, workerHandle.ID, taskID, strconv.Itoa(currentHash))
-					outputFile, err = os.OpenFile(currFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+					outputFile, err = os.OpenFile(currFilename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666) //not using Create() since output file for intermediate key can repeat for different keys
 					if err != nil {
-						log.Fatalf("cannot open %v", currFilename)
+						log.Printf("ERROR: cannot open %v", currFilename)
+						continue reset
 					}
 					encoder = json.NewEncoder(outputFile)
 				}
 
 				err := encoder.Encode(&kv)
 				if err != nil {
-					log.Fatalf("unable to write intermediate keys to destination: %v", err)
+					log.Printf("ERROR: unable to write intermediate keys to destination: %v", err)
+					continue reset
 				}
 			}
 			//since the last key won't trigger the if-else block above
 			if err = outputFile.Close(); err != nil {
-				log.Fatalf("failed to close output file %v: %v", outputFile.Name(), err)
+				log.Printf("ERROR: failed to close output file %v: %v", outputFile.Name(), err)
+				continue reset
 			} else {
 				outputFilepaths[currentHash] = outputFile.Name()
 			}
@@ -149,17 +145,21 @@ func Worker(mapf func(string, string) []KeyValue,
 			// filenamePattern := fmt.Sprintf(MapperIntermediateFilenameTemplatePattern, partitionID)
 			// log.Printf("searching for files matching intermediate output file(s) pattern %v ...\n", filenamePattern)
 			intermediateFilepaths := task.InputFilesSet //, err := filepath.Glob("./" + filenamePattern)
+			reducerOutputFilepath := fmt.Sprintf(ReducerFinalOutputFilenameTemplate, partitionID)
 
-			/* if err != nil {
-				log.Fatalf("unable to find intermediate files in the present working directory: %v", err)
-			} */
+			if len(intermediateFilepaths) == 0 { //no inputs for this partition mean the reducer output will be an empty file
+				log.Printf("WARN: reduce task for partition ID %v has no input files", partitionID)
+				outputFile, _ := os.Create(reducerOutputFilepath)
+				outputFile.Close()
+				workerHandle.updateCoordinatorOnTaskCompletion(coordinatorReply.IsMapTask, coordinatorReply.TaskID, Completed, outputFilepaths)
+				continue reset
+			}
 
 			// log.Printf("reading from intermediate (key, value) result files...\n")
 			intermediateKVList := []KeyValue{}
 			var file *os.File
 			var openErr error
 			for _, filepath := range intermediateFilepaths {
-				//find relevant filepaths
 				if file != nil {
 					file.Close()
 				}
@@ -167,7 +167,8 @@ func Worker(mapf func(string, string) []KeyValue,
 				file, openErr = os.Open(filepath)
 
 				if openErr != nil {
-					log.Fatalf("unable to read from intermediate output file at %v: %v", filepath, openErr)
+					log.Printf("ERROR: unable to read from intermediate output file at %v: %v", filepath, openErr)
+					continue reset
 				}
 				dec := json.NewDecoder(file)
 
@@ -185,26 +186,21 @@ func Worker(mapf func(string, string) []KeyValue,
 				file.Close()
 			}
 
-			if len(intermediateKVList) == 0 {
-				continue
-			}
-
-			//process collected intermediate key values
+			//order the list of (K,V) by key
 			sort.Sort(ByKey(intermediateKVList))
 
-			//process all values corresponding to one key
+			//for each key, process the corresponding list of values
 			curKey := intermediateKVList[0].Key
 			curValues := []string{}
-			filepath := fmt.Sprintf(ReducerFinalOutputFilenameTemplate, partitionID)
-			outputFile, fileErr := os.OpenFile(filepath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+			outputFile, fileErr := os.Create(reducerOutputFilepath)
 
 			if fileErr != nil {
-				log.Fatalf("unable to create reducer task output file %v: %v", filepath, fileErr)
+				log.Printf("ERROR: unable to create reducer task output file %v: %v", reducerOutputFilepath, fileErr)
+				continue reset
 			}
 
 			for _, kv := range intermediateKVList {
 				if kv.Key != curKey {
-					//won't process the last key
 					// log.Printf("running reduce function on values for key %v...\n", curKey)
 					reductionResult := reducef(curKey, curValues)
 					fmt.Fprintf(outputFile, "%v %v\n", curKey, reductionResult)
@@ -214,13 +210,14 @@ func Worker(mapf func(string, string) []KeyValue,
 				curValues = append(curValues, kv.Value)
 			}
 
-			//processing the last key
+			//process the last key in the (K,V) list
 			// log.Printf("running reduce function on values for key %v...\n", curKey)
 			reductionResult := reducef(curKey, curValues)
 			fmt.Fprintf(outputFile, "%v %v\n", curKey, reductionResult)
 
 			if err := outputFile.Close(); err != nil {
-				log.Fatalf("failed to close output file %v: %v", outputFile.Name(), err)
+				log.Printf("ERROR: failed to close output file %v: %v", outputFile.Name(), err)
+				continue reset
 			} else {
 				outputFilepaths[0] = outputFile.Name()
 			}
@@ -228,13 +225,13 @@ func Worker(mapf func(string, string) []KeyValue,
 			// log.Printf("completed writing final reducer output to file %v\n", outputFile)
 		}
 
-		//inform coordinator of task status
+		//inform coordinator of task completion
 		callSuccessful := workerHandle.updateCoordinatorOnTaskCompletion(coordinatorReply.IsMapTask, coordinatorReply.TaskID, Completed, outputFilepaths)
 
 		if !callSuccessful {
 			for _, filepath := range outputFilepaths {
 				if err := os.Remove(filepath); err != nil {
-					log.Fatalf("failed to cleanup stale output file %v: %v", filepath, err)
+					log.Fatalf("FATAL: failed to cleanup stale output file %v: %v", filepath, err)
 				}
 			}
 		}
@@ -293,13 +290,9 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 func (w *WorkerHandle) requestTaskFromCoordinator() *AssignTaskToWorkerProcessReply {
 
-	// declare an argument structure.
 	args := AssignTaskToWorkerProcessRequest{WorkerID: w.ID}
-
-	// declare a reply structure.
 	reply := AssignTaskToWorkerProcessReply{}
 
-	// send the RPC request, wait for the reply.
 	if ok := call("Coordinator.AssignTaskToWorkerProcess", &args, &reply); ok {
 		log.Printf("assigned task by coordinator: ID - %v, isMapTask - %v\n", reply.TaskID, reply.IsMapTask)
 		return &reply
@@ -311,7 +304,6 @@ func (w *WorkerHandle) requestTaskFromCoordinator() *AssignTaskToWorkerProcessRe
 
 func (w *WorkerHandle) updateCoordinatorOnTaskCompletion(isMapTask bool, taskID string, status TaskState, outputFilepaths map[int]string) bool {
 
-	// declare an argument structure.
 	// log.Println("updating coordinator on task completion")
 	args := TaskCompletionUpdateRequest{
 		WorkerID:    w.ID,
@@ -320,17 +312,10 @@ func (w *WorkerHandle) updateCoordinatorOnTaskCompletion(isMapTask bool, taskID 
 		State:       status,
 		OutputFiles: outputFilepaths,
 	}
-
-	// fill in the argument(s).
 	// log.Println("task status - ", args)
 
-	// declare a reply structure.
 	reply := TaskCompletionUpdateReply{}
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
 	if ok := call("Coordinator.ReceiveTaskCompletionUpdate", &args, &reply); ok {
 		log.Printf("update from coordinator: %v\n", reply.Message)
 		return true

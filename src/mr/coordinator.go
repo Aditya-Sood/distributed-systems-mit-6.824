@@ -24,7 +24,6 @@ const (
 	Completed
 )
 
-// TODO: make struct private
 type TaskConfig struct {
 	ID               string
 	State            TaskState
@@ -177,8 +176,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 }
 
 func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessRequest, reply *AssignTaskToWorkerProcessReply) error {
-	// TODO: Check for errors and return appropriately below
-	//c.RTasks[ind].InputIntermediateFiles
 
 	//Check for available mapper tasks
 	reply.AllTasksCompleted = false
@@ -199,8 +196,7 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 	}
 
 	if avlTaskInd == -1 && mapTasksInProgress {
-		//No map tasks are pending but one or more are in-progress
-		//So can't start reducer phase
+		//No map tasks are pending but one or more are in-progress, so can't start reducer phase
 		//Hence not assigning new tasks
 
 		reply.TaskID = ""
@@ -212,10 +208,12 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 	} else if avlTaskInd != -1 {
 		log.Printf("found pending mapper task %v\n", avlTaskInd)
 
+		//Set coordinator values
 		c.MTasks[avlTaskInd].AssignedWorkerID = args.WorkerID
 		c.MTasks[avlTaskInd].StartTime = time.Now()
 		c.MTasks[avlTaskInd].State = InProgress
 
+		//Prepare reply for worker
 		reply.TaskID = c.MTasks[avlTaskInd].ID
 		taskStruct := c.MTasks[avlTaskInd].MapTaskDetails
 
@@ -235,7 +233,7 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 		return nil
 	}
 
-	//TODO: Fix based on logic at the top
+	//No pending mapper tasks exist at this point
 	//Check for available reducer tasks
 	reply.IsMapTask = false
 	reduceTasksInProgress := false
@@ -253,7 +251,6 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 		}
 	}
 
-	//No pending (mapper or reducer) tasks exist
 	if avlTaskInd == -1 && reduceTasksInProgress {
 		//No reduce tasks are pending but one or more are in-progress
 		//So can't end worker
@@ -279,7 +276,9 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 
 		for _, mTask := range c.MTasks {
 			filepath := mTask.OutputIntermediateFiles[reducerTaskPartitionID]
-			intermediateFiles = append(intermediateFiles, filepath)
+			if filepath != "" { // as it's possible for there to be no input intermediate files for a particular parition ID
+				intermediateFiles = append(intermediateFiles, filepath)
+			}
 		}
 
 		taskStruct := ReduceTaskDetails{
@@ -307,31 +306,34 @@ func (c *Coordinator) AssignTaskToWorkerProcess(args *AssignTaskToWorkerProcessR
 }
 
 func (c *Coordinator) checkTaskResult(task interface{}) {
-	//increased task completion timeout period from 10s since tasks are always alive when resetting tasks, plus a framework-accurate heartbeat model would behave the same
+	//increased task completion timeout period from 10s since tasks are always alive when reset, plus a framework-accurate heartbeat model would behave the same
 	time.Sleep(60 * time.Second)
 
 	var taskCfg *TaskConfig
 	var taskMtx *sync.RWMutex
+	var taskType string
 
 	if mTask, ok := task.(*MapTask); ok {
 		taskCfg = &(mTask.TaskConfig)
 		taskMtx = &c.MMtx
+		taskType = "map"
 
 	} else if rTask, ok := task.(*ReduceTask); ok {
 		taskCfg = &(rTask.TaskConfig)
 		taskMtx = &c.RMtx
+		taskType = "reduce"
 
 	} else {
 		log.Fatalf("ERROR: received value is of unexpected type %T\n", task)
 		return
 	}
 
-	log.Printf("checking status of task %v\n", taskCfg.ID)
+	log.Printf("checking status of %v task %v\n", taskType, taskCfg.ID)
 
 	taskMtx.Lock()
 	defer taskMtx.Unlock()
 	if taskCfg.State != Completed {
-		log.Printf("task %v not completed, resetting...\n", taskCfg.ID)
+		log.Printf("%v task %v not completed, resetting...\n", taskType, taskCfg.ID)
 
 		taskCfg.StartTime = time.Time{}
 		taskCfg.State = Pending

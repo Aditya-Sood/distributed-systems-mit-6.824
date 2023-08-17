@@ -24,6 +24,7 @@ type ExampleReply struct {
 	Y int
 }
 
+// Add your RPC definitions here.
 type AssignTaskToWorkerProcessRequest struct {
 	WorkerID string
 }
@@ -46,8 +47,6 @@ type TaskCompletionUpdateRequest struct {
 type TaskCompletionUpdateReply struct {
 	Message string
 }
-
-// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
